@@ -12,10 +12,16 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Log in to DockerHub
         uses: docker/login-action@v3
@@ -26,18 +32,65 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push unage
+      - name: Build and push image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: ${{ github.ref == 'refs/heads/master' }}
           tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
             ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Summary
         run: |
           echo "### Build complete" >> $GITHUB_STEP_SUMMARY
-          echo "Image: ${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+
+  open-gitops-pr:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout platform-gitops
+        uses: actions/checkout@v4
+        with:
+          repository: phanle1010/platform-gitops
+          token: ${{ secrets.GITOPS_PAT }}
+          path: platform-gitops
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Update staging image tag
+        working-directory: platform-gitops
+        run: |
+          cd apps/platform-app/overlays/staging
+          kustomize edit set image ${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Create PR in platform-gitops
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITOPS_PAT }}
+          path: platform-gitops
+          branch: deploy/staging-${{ needs.build-and-push.outputs.image_tag }}
+          base: master
+          title: "deploy: update staging image to ${{ needs.build-and-push.outputs.image_tag }}"
+          body: |
+            ## Staging deploy
+
+            Updates staging image tag to `${{ needs.build-and-push.outputs.image_tag }}`.
+
+            **Source commit:** ${{ github.sha }}
+            **Triggered by:** ${{ github.actor }}
+            **Image:** `${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}`
+
+            After merging, ArgoCD will sync this to the staging cluster automatically.
+          labels: |
+            deploy
+            staging
+          draft: false
